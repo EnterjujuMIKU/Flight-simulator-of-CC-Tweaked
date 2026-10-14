@@ -9,12 +9,13 @@
 ---------------------------------------------------------------------
 local VIEW_DIST  = 200   -- distance de vue (blocs)
 local GRID_STEP  = 8      -- taille des mailles proches
-local RING_N     = 16     -- mailles par demi-anneau (DOIT etre pair). Baisse a 8 si ca rame
+local RING_N     = 10     -- mailles par demi-anneau (DOIT etre pair). Baisse a 8 si ca rame
 local FOG_DIST   = 250    -- au-dela, les lignes passent en gris
+local SUBPIXEL   = true   -- true : 2x3 pixels par caractere (detail x6, plus lourd)
 local GRID_DIST  = 250    -- au-dela, plus de lignes : le relief reste visible en silhouette noire
 
-local PATH_MODE  = "waypoints"  -- "infinity" ou "waypoints"
-local SPEED      = 25          -- vitesse de l'avion (blocs/s)
+local PATH_MODE  = "infinity"  -- "infinity" ou "waypoints"
+local SPEED      = 22          -- vitesse de l'avion (blocs/s)
 
 -- Boucle irreguliere (mode "waypoints") : {x, altitude, z}
 local WAYPOINTS = {
@@ -38,7 +39,7 @@ local win = window.create(out, 1, 1, W, H, false)
 
 local hex = {}
 for name, c in pairs(colors) do
-  if type(c) == "number" then hex[name] = colors.toBlit(c) end
+  if type(c) == "number" then hex[name] = tonumber(colors.toBlit(c), 16) end
 end
 
 local SKY    = hex.lightBlue
@@ -46,22 +47,92 @@ local GROUND = hex.black
 local GRAYC  = hex.gray
 
 local floor, ceil = math.floor, math.ceil
-local fb, D = {}, {}   -- couleurs / profondeur (1/z)
-for y = 1, H do fb[y] = {}; D[y] = {} end
+
+-- Resolution interne : en mode SUBPIXEL chaque caractere = 2x3 pixels
+-- (caracteres 128-159), soit 6x plus de details.
+local SW, SH = W, H
+if SUBPIXEL then SW, SH = W * 2, H * 3 end
+
+local fb, D = {}, {}   -- couleurs (0-15) / profondeur (1/z), en pixels
+for y = 1, SH do fb[y] = {}; D[y] = {} end
 
 local function clearBuffers()
-  for y = 1, H do
+  for y = 1, SH do
     local row, drow = fb[y], D[y]
-    for x = 1, W do row[x] = SKY; drow[x] = 0 end
+    for x = 1, SW do row[x] = SKY; drow[x] = 0 end
   end
 end
 
+-- palette par defaut de CC, pour choisir la couleur la plus proche
+local PAL = {
+  {240,240,240},{242,178,51},{229,127,216},{153,178,242},{222,222,108},{127,204,25},
+  {242,178,204},{76,76,76},{153,153,153},{76,153,178},{178,102,229},{51,102,204},
+  {127,102,76},{87,166,78},{204,76,76},{17,17,17},
+}
+local DIST = {}
+for a = 0, 15 do
+  DIST[a] = {}
+  for b = 0, 15 do
+    local pa, pb = PAL[a + 1], PAL[b + 1]
+    DIST[a][b] = (pa[1] - pb[1]) ^ 2 + (pa[2] - pb[2]) ^ 2 + (pa[3] - pb[3]) ^ 2
+  end
+end
+
+local BLC, CH = {}, {}
+for i = 0, 15 do BLC[i] = string.sub("0123456789abcdef", i + 1, i + 1) end
+for b = 0, 31 do CH[b] = string.char(128 + b) end
+local BITV = { 1, 2, 4, 8, 16, 32 }
+local cols, px6 = {}, {}
+
 local function present()
-  local txt = string.rep(" ", W)
-  local fg  = string.rep("0", W)
-  for y = 1, H do
-    win.setCursorPos(1, y)
-    win.blit(txt, fg, table.concat(fb[y]))
+  if not SUBPIXEL then
+    local txt = string.rep(" ", W)
+    local fg  = string.rep("0", W)
+    for y = 1, H do
+      local row, bgs = fb[y], {}
+      for x = 1, W do bgs[x] = BLC[row[x]] end
+      win.setCursorPos(1, y)
+      win.blit(txt, fg, table.concat(bgs))
+    end
+    return
+  end
+
+  local chr, fgs, bgs = {}, {}, {}
+  for cyc = 1, H do
+    local r1, r2, r3 = fb[cyc * 3 - 2], fb[cyc * 3 - 1], fb[cyc * 3]
+    for cxc = 1, W do
+      local x = cxc * 2
+      local c1, c2, c3, c4, c5, c6 = r1[x - 1], r1[x], r2[x - 1], r2[x], r3[x - 1], r3[x]
+      if c1 == c2 and c2 == c3 and c3 == c4 and c4 == c5 and c5 == c6 then
+        chr[cxc], fgs[cxc], bgs[cxc] = " ", "0", BLC[c6]
+      else
+        -- le pixel bas-droit sert de fond (le bit 32 n'existe pas en 128-159)
+        cols[1], cols[2], cols[3], cols[4], cols[5] = c1, c2, c3, c4, c5
+        px6[1], px6[2], px6[3], px6[4], px6[5], px6[6] = c1, c2, c3, c4, c5, c6
+        local best, bestn = c6, 0
+        for i = 1, 5 do
+          local c = cols[i]
+          if c ~= c6 then
+            local n = 0
+            for j = 1, 5 do if cols[j] == c then n = n + 1 end end
+            if n > bestn then bestn, best = n, c end
+          end
+        end
+        local bits = 0
+        if bestn > 0 then
+          local dbest, dbg = DIST[best], DIST[c6]
+          for i = 1, 5 do
+            local c = px6[i]
+            if c == best or (c ~= c6 and dbest[c] < dbg[c]) then
+              bits = bits + BITV[i]
+            end
+          end
+        end
+        chr[cxc], fgs[cxc], bgs[cxc] = CH[bits], BLC[best], BLC[c6]
+      end
+    end
+    win.setCursorPos(1, cyc)
+    win.blit(table.concat(chr), table.concat(fgs), table.concat(bgs))
   end
 end
 
@@ -73,7 +144,7 @@ local P, Q = {0, 0, 0, 0}, {0, 0, 0, 0}
 local function line2d(x0, y0, w0, x1, y1, w1, c)
   local dx, dy = x1 - x0, y1 - y0
   P[1], P[2], P[3], P[4] = -dx, dx, -dy, dy
-  Q[1], Q[2], Q[3], Q[4] = x0 - 1, W - x0, y0 - 1, H - y0
+  Q[1], Q[2], Q[3], Q[4] = x0 - 1, SW - x0, y0 - 1, SH - y0
   local t0, t1 = 0, 1
   for i = 1, 4 do
     local p, q = P[i], Q[i]
@@ -102,7 +173,7 @@ local function line2d(x0, y0, w0, x1, y1, w1, c)
   local w = wa
   local err = adx - ady
   while true do
-    if ax >= 1 and ax <= W and ay >= 1 and ay <= H and w >= D[ay][ax] then
+    if ax >= 1 and ax <= SW and ay >= 1 and ay <= SH and w >= D[ay][ax] then
       fb[ay][ax] = c
     end
     if ax == bx and ay == by then break end
@@ -127,10 +198,10 @@ local function fillTri(x0, y0, w0, x1, y1, w1, x2, y2, w2, col)
   if y1 < miny then miny = y1 elseif y1 > maxy then maxy = y1 end
   if y2 < miny then miny = y2 elseif y2 > maxy then maxy = y2 end
   local ix0 = ceil(minx); if ix0 < 1 then ix0 = 1 end
-  local ix1 = floor(maxx); if ix1 > W then ix1 = W end
+  local ix1 = floor(maxx); if ix1 > SW then ix1 = SW end
   if ix0 > ix1 then return end
   local iy0 = ceil(miny); if iy0 < 1 then iy0 = 1 end
-  local iy1 = floor(maxy); if iy1 > H then iy1 = H end
+  local iy1 = floor(maxy); if iy1 > SH then iy1 = SH end
   if iy0 > iy1 then return end
 
   local det = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
@@ -163,11 +234,11 @@ end
 -- Camera + projection
 ---------------------------------------------------------------------
 local FOV    = math.rad(70)
-local FOCAL  = (W / 2) / math.tan(FOV / 2)
-local ASPECT = 0.6          -- une cellule de texte est plus haute que large
+local FOCAL  = (SW / 2) / math.tan(FOV / 2)
+local ASPECT = SUBPIXEL and 1.0 or 0.6   -- sous-pixels carres ; une cellule entiere est plus haute que large
 local FY     = FOCAL * ASPECT
 local NEAR   = 0.3
-local cx, cy = W / 2, H / 2
+local cx, cy = SW / 2, SH / 2
 
 local cam = { x = 0, y = 0, z = 0, rx = 1, ry = 0, rz = 0, ux = 0, uy = 1, uz = 0, fx = 0, fy = 0, fz = 1 }
 
