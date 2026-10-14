@@ -7,15 +7,16 @@
 ---------------------------------------------------------------------
 -- CONFIG
 ---------------------------------------------------------------------
-local VIEW_DIST  = 200   -- distance de vue (blocs)
+local VIEW_DIST  = 1000   -- distance de vue (blocs)
 local GRID_STEP  = 8      -- taille des mailles proches
 local RING_N     = 10     -- mailles par demi-anneau (DOIT etre pair). Baisse a 8 si ca rame
-local FOG_DIST   = 250    -- au-dela, les lignes passent en gris
+local FOG_DIST   = 750    -- au-dela, les lignes passent en gris
+local FPS_MAX    = 20     -- limite d'images/seconde (1 a 60)
 local SUBPIXEL   = true   -- true : 2x3 pixels par caractere (detail x6, plus lourd)
-local GRID_DIST  = 250    -- au-dela, plus de lignes : le relief reste visible en silhouette noire
+local GRID_DIST  = 1000    -- au-dela, plus de lignes : le relief reste visible en silhouette noire
 
 local PATH_MODE  = "infinity"  -- "infinity" ou "waypoints"
-local SPEED      = 22          -- vitesse de l'avion (blocs/s)
+local SPEED      = 25          -- vitesse de l'avion (blocs/s)
 
 -- Boucle irreguliere (mode "waypoints") : {x, altitude, z}
 local WAYPOINTS = {
@@ -609,18 +610,43 @@ do
   cam.z = plane.z - plane.fz * 16
 end
 
-local last = os.clock()
+-- horloge precise (ms) si disponible
+local function now()
+  if os.epoch then return os.epoch("utc") / 1000 end
+  return os.clock()
+end
+
+local FRAME = 1 / math.max(1, math.min(60, FPS_MAX))
+local last = now()
+local nextT = last
 local fps, frames, fpsT = 0, 0, last
-local timer = os.startTimer(0)
+local timer
+
+-- planifie l'image suivante. <= 20 FPS : timer (1 tick = 0,05 s).
+-- > 20 FPS : attente active via evenements (les timers sont limites a 20/s).
+local function schedule()
+  local t0 = now()
+  nextT = nextT + FRAME
+  if nextT < t0 then nextT = t0 end          -- en retard : pas de rattrapage
+  if FRAME >= 0.05 then
+    timer = os.startTimer(math.max(0, nextT - t0))
+  else
+    os.queueEvent("frame")
+  end
+end
+
+if FRAME >= 0.05 then timer = os.startTimer(0) else os.queueEvent("frame") end
 
 while true do
   local ev, p1 = os.pullEvent()
   if ev == "key" and p1 == keys.q then
     break
-  elseif ev == "timer" and p1 == timer then
-    local now = os.clock()
-    local dt = math.min(now - last, 0.2)
-    last = now
+  elseif ev == "frame" and now() < nextT then
+    os.queueEvent("frame")                    -- pas encore l'heure : on patiente
+  elseif (ev == "timer" and p1 == timer) or ev == "frame" then
+    local tnow = now()
+    local dt = math.min(tnow - last, 0.2)
+    last = tnow
 
     t = t + SPEED * dt
     updatePlane(t, dt)
@@ -636,24 +662,26 @@ while true do
     if cam.y < minY then cam.y = minY end
     lookAt(plane.x + plane.fx * 8, plane.y + plane.fy * 8 - 1, plane.z + plane.fz * 8)
 
+    local r0 = now()
     clearBuffers()
     drawTerrain()
     drawPlane()
     present()
+    local renderMs = (now() - r0) * 1000
 
     frames = frames + 1
-    if now - fpsT >= 1 then
-      fps = frames / (now - fpsT)
-      frames, fpsT = 0, now
+    if tnow - fpsT >= 1 then
+      fps = frames / (tnow - fpsT)
+      frames, fpsT = 0, tnow
     end
     win.setBackgroundColor(colors.black)
     win.setTextColor(colors.white)
     win.setCursorPos(1, 1)
-    win.write(string.format(" FPS:%.0f  Alt:%d  [Q] quitter ", fps, floor(plane.y)))
+    win.write(string.format(" FPS:%.0f  rendu:%.0fms  Alt:%d  [Q] ", fps, renderMs, floor(plane.y)))
     win.setVisible(true)
     win.setVisible(false)
 
-    timer = os.startTimer(0)
+    schedule()
   end
 end
 
