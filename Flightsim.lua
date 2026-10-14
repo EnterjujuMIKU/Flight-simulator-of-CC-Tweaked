@@ -1,10 +1,35 @@
 -- flight.lua : simulation 3D filaire pour CC: Tweaked
--- Terrain en quadrillage + avion qui suit une boucle ultra fluide
--- Ordinateur avance (gold) recommande, ou moniteur branche (rendu plus fin).
--- Touche Q pour quitter.
+-- * Terrain en quadrillage visible jusqu'a ~1000 blocs (LOD par anneaux)
+-- * Suppression des lignes cachees (z-buffer + relief opaque)
+-- * Avion sur une boucle en spline (signe infini ou points predefinis)
+-- Ordinateur avance (gold) ou moniteur. Touche Q pour quitter.
 
 ---------------------------------------------------------------------
--- Affichage (terminal ou moniteur) + framebuffer
+-- CONFIG
+---------------------------------------------------------------------
+local VIEW_DIST  = 1000   -- distance de vue (blocs)
+local GRID_STEP  = 8      -- taille des mailles proches
+local RING_N     = 10     -- mailles par demi-anneau (DOIT etre pair). Baisse a 8 si ca rame
+local FOG_DIST   = 350    -- au-dela, les lignes passent en gris
+local GRID_DIST  = 700    -- au-dela, plus de lignes : le relief reste visible en silhouette noire
+
+local PATH_MODE  = "infinity"  -- "infinity" ou "waypoints"
+local SPEED      = 22          -- vitesse de l'avion (blocs/s)
+
+-- Boucle irreguliere (mode "waypoints") : {x, altitude, z}
+local WAYPOINTS = {
+  {   0, 30,    0 },
+  {  70, 38,   40 },
+  { 130, 28,  -10 },
+  { 150, 45,  -80 },
+  {  60, 32, -130 },
+  { -40, 26,  -90 },
+  {-110, 40,  -30 },
+  { -70, 30,   50 },
+}
+
+---------------------------------------------------------------------
+-- Affichage (terminal ou moniteur) + framebuffers
 ---------------------------------------------------------------------
 local out = peripheral.find("monitor")
 if out then out.setTextScale(0.5) else out = term.current() end
@@ -17,13 +42,17 @@ for name, c in pairs(colors) do
 end
 
 local SKY    = hex.lightBlue
-local fb = {}
-for y = 1, H do fb[y] = {} end
+local GROUND = hex.black
+local GRAYC  = hex.gray
 
-local function clearFb()
+local floor, ceil = math.floor, math.ceil
+local fb, D = {}, {}   -- couleurs / profondeur (1/z)
+for y = 1, H do fb[y] = {}; D[y] = {} end
+
+local function clearBuffers()
   for y = 1, H do
-    local row = fb[y]
-    for x = 1, W do row[x] = SKY end
+    local row, drow = fb[y], D[y]
+    for x = 1, W do row[x] = SKY; drow[x] = 0 end
   end
 end
 
@@ -37,12 +66,11 @@ local function present()
 end
 
 ---------------------------------------------------------------------
--- Dessin de lignes 2D (clipping Liang-Barsky + Bresenham)
+-- Rasterisation : lignes avec test de profondeur
 ---------------------------------------------------------------------
 local P, Q = {0, 0, 0, 0}, {0, 0, 0, 0}
-local floor = math.floor
 
-local function line2d(x0, y0, x1, y1, c)
+local function line2d(x0, y0, w0, x1, y1, w1, c)
   local dx, dy = x1 - x0, y1 - y0
   P[1], P[2], P[3], P[4] = -dx, dx, -dy, dy
   Q[1], Q[2], Q[3], Q[4] = x0 - 1, W - x0, y0 - 1, H - y0
@@ -62,29 +90,84 @@ local function line2d(x0, y0, x1, y1, c)
       end
     end
   end
+  local dwl = w1 - w0
+  local wa, wb = w0 + dwl * t0, w0 + dwl * t1
   local ax, ay = floor(x0 + t0 * dx + 0.5), floor(y0 + t0 * dy + 0.5)
   local bx, by = floor(x0 + t1 * dx + 0.5), floor(y0 + t1 * dy + 0.5)
   local sx = ax < bx and 1 or -1
   local sy = ay < by and 1 or -1
   local adx, ady = math.abs(bx - ax), math.abs(by - ay)
+  local n = adx > ady and adx or ady
+  local dw = n > 0 and (wb - wa) / n or 0
+  local w = wa
   local err = adx - ady
   while true do
-    if ax >= 1 and ax <= W and ay >= 1 and ay <= H then fb[ay][ax] = c end
+    if ax >= 1 and ax <= W and ay >= 1 and ay <= H and w >= D[ay][ax] then
+      fb[ay][ax] = c
+    end
     if ax == bx and ay == by then break end
     local e2 = 2 * err
     if e2 > -ady then err = err - ady; ax = ax + sx end
     if e2 < adx then err = err + adx; ay = ay + sy end
+    w = w + dw
+  end
+end
+
+---------------------------------------------------------------------
+-- Rasterisation : triangles remplis (relief opaque) avec z-buffer
+-- La profondeur stockee est legerement reculee (polygon offset) pour
+-- que les lignes posees sur la surface restent visibles.
+---------------------------------------------------------------------
+local EPS = 1e-4
+
+local function fillTri(x0, y0, w0, x1, y1, w1, x2, y2, w2, col)
+  local minx, maxx, miny, maxy = x0, x0, y0, y0
+  if x1 < minx then minx = x1 elseif x1 > maxx then maxx = x1 end
+  if x2 < minx then minx = x2 elseif x2 > maxx then maxx = x2 end
+  if y1 < miny then miny = y1 elseif y1 > maxy then maxy = y1 end
+  if y2 < miny then miny = y2 elseif y2 > maxy then maxy = y2 end
+  local ix0 = ceil(minx); if ix0 < 1 then ix0 = 1 end
+  local ix1 = floor(maxx); if ix1 > W then ix1 = W end
+  if ix0 > ix1 then return end
+  local iy0 = ceil(miny); if iy0 < 1 then iy0 = 1 end
+  local iy1 = floor(maxy); if iy1 > H then iy1 = H end
+  if iy0 > iy1 then return end
+
+  local det = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
+  if det == 0 then return end
+  local inv = 1 / det
+  local A0, B0 = (y1 - y2) * inv, (x2 - x1) * inv
+  local A1, B1 = (y2 - y0) * inv, (x0 - x2) * inv
+  local dw0, dw1 = w0 - w2, w1 - w2
+  local dwx = A0 * dw0 + A1 * dw1
+  local dwy = B0 * dw0 + B1 * dw1
+  local bias = (dwx < 0 and -dwx or dwx) + (dwy < 0 and -dwy or dwy)
+             + (w0 + w1 + w2) * 0.00067
+
+  for py = iy0, iy1 do
+    local ddy, ddx = py - y2, ix0 - x2
+    local l0 = A0 * ddx + B0 * ddy
+    local l1 = A1 * ddx + B1 * ddy
+    local w = w2 + l0 * dw0 + l1 * dw1 - bias
+    local row, drow = fb[py], D[py]
+    for px = ix0, ix1 do
+      if l0 >= -EPS and l1 >= -EPS and (1 - l0 - l1) >= -EPS then
+        if w > drow[px] then drow[px] = w; row[px] = col end
+      end
+      l0 = l0 + A0; l1 = l1 + A1; w = w + dwx
+    end
   end
 end
 
 ---------------------------------------------------------------------
 -- Camera + projection
 ---------------------------------------------------------------------
-local FOV     = math.rad(70)
-local FOCAL   = (W / 2) / math.tan(FOV / 2)
-local ASPECT  = 0.6          -- une cellule de texte est plus haute que large
-local NEAR    = 0.3
-local FAR     = 110
+local FOV    = math.rad(70)
+local FOCAL  = (W / 2) / math.tan(FOV / 2)
+local ASPECT = 0.6          -- une cellule de texte est plus haute que large
+local FY     = FOCAL * ASPECT
+local NEAR   = 0.3
+local cx, cy = W / 2, H / 2
 
 local cam = { x = 0, y = 0, z = 0, rx = 1, ry = 0, rz = 0, ux = 0, uy = 1, uz = 0, fx = 0, fy = 0, fz = 1 }
 
@@ -107,7 +190,6 @@ local function lookAt(tx, ty, tz)
   cam.ux, cam.uy, cam.uz = ux, uy, uz
 end
 
--- monde -> espace camera
 local function toCam(x, y, z)
   local dx, dy, dz = x - cam.x, y - cam.y, z - cam.z
   return dx * cam.rx + dy * cam.ry + dz * cam.rz,
@@ -115,9 +197,8 @@ local function toCam(x, y, z)
          dx * cam.fx + dy * cam.fy + dz * cam.fz
 end
 
-local cx, cy = W / 2, H / 2
+-- ligne en espace camera (decoupe plan proche + projection)
 local function drawCamLine(ax, ay, az, bx, by, bz, c)
-  -- clipping sur le plan proche
   if az < NEAR and bz < NEAR then return end
   if az < NEAR then
     local t = (NEAR - az) / (bz - az)
@@ -126,11 +207,9 @@ local function drawCamLine(ax, ay, az, bx, by, bz, c)
     local t = (NEAR - bz) / (az - bz)
     bx, by, bz = bx + (ax - bx) * t, by + (ay - by) * t, NEAR
   end
-  local x0 = cx + ax / az * FOCAL
-  local y0 = cy - ay / az * FOCAL * ASPECT
-  local x1 = cx + bx / bz * FOCAL
-  local y1 = cy - by / bz * FOCAL * ASPECT
-  line2d(x0, y0, x1, y1, c)
+  local w0, w1 = 1 / az, 1 / bz
+  line2d(cx + ax * w0 * FOCAL, cy - ay * w0 * FY, w0,
+         cx + bx * w1 * FOCAL, cy - by * w1 * FY, w1, c)
 end
 
 local function drawWorldLine(x0, y0, z0, x1, y1, z1, c)
@@ -139,8 +218,36 @@ local function drawWorldLine(x0, y0, z0, x1, y1, z1, c)
   drawCamLine(ax, ay, az, bx, by, bz, c)
 end
 
+-- triangle en espace camera, avec decoupe sur le plan proche
+local function fillTriCam(ax, ay, az, bx, by, bz, px, py, pz, col)
+  local xs, ys, zs = { ax, bx, px }, { ay, by, py }, { az, bz, pz }
+  local ox, oy, oz, n = {}, {}, {}, 0
+  for i = 1, 3 do
+    local j = i % 3 + 1
+    local zi, zj = zs[i], zs[j]
+    local ini, inj = zi >= NEAR, zj >= NEAR
+    if ini then n = n + 1; ox[n], oy[n], oz[n] = xs[i], ys[i], zi end
+    if ini ~= inj then
+      local t = (NEAR - zi) / (zj - zi)
+      n = n + 1
+      ox[n] = xs[i] + (xs[j] - xs[i]) * t
+      oy[n] = ys[i] + (ys[j] - ys[i]) * t
+      oz[n] = NEAR
+    end
+  end
+  if n < 3 then return end
+  local sx, sy, sw = {}, {}, {}
+  for i = 1, n do
+    local iw = 1 / oz[i]
+    sx[i], sy[i], sw[i] = cx + ox[i] * iw * FOCAL, cy - oy[i] * iw * FY, iw
+  end
+  for i = 2, n - 1 do
+    fillTri(sx[1], sy[1], sw[1], sx[i], sy[i], sw[i], sx[i + 1], sy[i + 1], sw[i + 1], col)
+  end
+end
+
 ---------------------------------------------------------------------
--- Terrain
+-- Terrain : anneaux a resolution decroissante (clipmap)
 ---------------------------------------------------------------------
 local function terrainH(x, z)
   local h = 8 * math.sin(x * 0.05) * math.cos(z * 0.06)
@@ -158,42 +265,118 @@ local function heightColor(h)
   else return hex.white end
 end
 
-local STEP, N = 8, 11
+local N = RING_N - (RING_N % 2)           -- force un nombre pair
 local SIDE = 2 * N + 1
-local vx, vy, vz, vh = {}, {}, {}, {}
+local RINGS = math.max(1, ceil(math.log(VIEW_DIST / (N * GRID_STEP)) / math.log(2)) + 1)
+
+local vx, vy, vz, vsx, vsy, vsw, vok, vcol = {}, {}, {}, {}, {}, {}, {}, {}
+local keep = {}
+local holeX0, holeX1, holeZ0, holeZ1 = 0, 0, 0, 0
+
+local function kept(a, b)
+  if a < 0 or b < 0 or a >= SIDE - 1 or b >= SIDE - 1 then return false end
+  return keep[a * SIDE + b + 1]
+end
+
+local function tri(i, j, k)
+  local zi, zj, zk = vz[i], vz[j], vz[k]
+  if zi < NEAR and zj < NEAR and zk < NEAR then return end
+  if vok[i] and vok[j] and vok[k] then
+    fillTri(vsx[i], vsy[i], vsw[i], vsx[j], vsy[j], vsw[j], vsx[k], vsy[k], vsw[k], GROUND)
+  else
+    fillTriCam(vx[i], vy[i], zi, vx[j], vy[j], zj, vx[k], vy[k], zk, GROUND)
+  end
+end
+
+local function edge(i, j)
+  local zi, zj = vz[i], vz[j]
+  if zi < NEAR and zj < NEAR then return end
+  if zi > GRID_DIST and zj > GRID_DIST then return end
+  if vok[i] and vok[j] then
+    line2d(vsx[i], vsy[i], vsw[i], vsx[j], vsy[j], vsw[j], vcol[i])
+  else
+    drawCamLine(vx[i], vy[i], zi, vx[j], vy[j], zj, vcol[i])
+  end
+end
 
 local function drawTerrain()
-  local gx0 = floor(cam.x / STEP)
-  local gz0 = floor(cam.z / STEP)
-  local k = 0
-  for i = -N, N do
-    local wx = (gx0 + i) * STEP
-    for j = -N, N do
-      local wz = (gz0 + j) * STEP
-      local h = terrainH(wx, wz)
-      k = k + 1
-      vx[k], vy[k], vz[k] = toCam(wx, h, wz)
-      vh[k] = h
+  local rx, ry, rz = cam.rx, cam.ry, cam.rz
+  local ux, uy, uz = cam.ux, cam.uy, cam.uz
+  local fx, fy, fz = cam.fx, cam.fy, cam.fz
+  local camx, camy, camz = cam.x, cam.y, cam.z
+
+  for r = 0, RINGS - 1 do
+    local S = GRID_STEP * 2 ^ r
+    local last = (r == RINGS - 1)
+    -- le centre de chaque anneau est cale sur la grille de l'anneau
+    -- suivant : les trous tombent pile sur des bords de mailles
+    local snap = last and S or S * 2
+    local ccx = floor(camx / snap) * snap
+    local ccz = floor(camz / snap) * snap
+    local gx0, gz0 = floor(ccx / S + 0.5), floor(ccz / S + 0.5)
+
+    -- sommets
+    local k = 0
+    for i = 0, SIDE - 1 do
+      local wx = ccx + (i - N) * S
+      for j = 0, SIDE - 1 do
+        local wz = ccz + (j - N) * S
+        local h
+        -- bord exterieur : sommets impairs interpoles => raccord sans trou
+        if not last and (i == 0 or i == SIDE - 1) and (gz0 + j - N) % 2 == 1 then
+          h = (terrainH(wx, wz - S) + terrainH(wx, wz + S)) * 0.5
+        elseif not last and (j == 0 or j == SIDE - 1) and (gx0 + i - N) % 2 == 1 then
+          h = (terrainH(wx - S, wz) + terrainH(wx + S, wz)) * 0.5
+        else
+          h = terrainH(wx, wz)
+        end
+        k = k + 1
+        local dx, dy, dz = wx - camx, h - camy, wz - camz
+        local x = dx * rx + dy * ry + dz * rz
+        local y = dx * ux + dy * uy + dz * uz
+        local z = dx * fx + dy * fy + dz * fz
+        vx[k], vy[k], vz[k] = x, y, z
+        if z >= NEAR then
+          local iw = 1 / z
+          vsx[k], vsy[k], vsw[k], vok[k] = cx + x * iw * FOCAL, cy - y * iw * FY, iw, true
+        else
+          vok[k] = false
+        end
+        vcol[k] = (z > FOG_DIST) and GRAYC or heightColor(h)
+      end
     end
-  end
-  for i = 0, SIDE - 1 do
-    for j = 0, SIDE - 1 do
-      local a = i * SIDE + j + 1
-      local az = vz[a]
-      local col = heightColor(vh[a])
-      if j < SIDE - 1 then
-        local b = a + 1
-        if az < FAR or vz[b] < FAR then
-          drawCamLine(vx[a], vy[a], az, vx[b], vy[b], vz[b], col)
+
+    -- mailles : relief rempli (sauf zone deja couverte par l'anneau fin)
+    for a = 0, SIDE - 2 do
+      local x = ccx + (a - N) * S
+      for b = 0, SIDE - 2 do
+        local z = ccz + (b - N) * S
+        local kp = true
+        if r > 0 and x >= holeX0 and x + S <= holeX1 and z >= holeZ0 and z + S <= holeZ1 then
+          kp = false
+        end
+        keep[a * SIDE + b + 1] = kp
+        if kp then
+          local v00 = a * SIDE + b + 1
+          local v01, v10 = v00 + 1, v00 + SIDE
+          local v11 = v10 + 1
+          tri(v00, v01, v10)
+          tri(v01, v11, v10)
         end
       end
-      if i < SIDE - 1 then
-        local b = a + SIDE
-        if az < FAR or vz[b] < FAR then
-          drawCamLine(vx[a], vy[a], az, vx[b], vy[b], vz[b], col)
-        end
+    end
+
+    -- lignes du quadrillage (testees contre le z-buffer)
+    for a = 0, SIDE - 1 do
+      for b = 0, SIDE - 1 do
+        local v = a * SIDE + b + 1
+        if b < SIDE - 1 and (kept(a, b) or kept(a - 1, b)) then edge(v, v + 1) end
+        if a < SIDE - 1 and (kept(a, b) or kept(a, b - 1)) then edge(v, v + SIDE) end
       end
     end
+
+    holeX0, holeX1 = ccx - N * S, ccx + N * S
+    holeZ0, holeZ1 = ccz - N * S, ccz + N * S
   end
 end
 
@@ -244,32 +427,13 @@ local function drawPlane()
   -- ombre au sol
   local gh = terrainH(plane.x, plane.z)
   local s = 2.5
-  drawWorldLine(plane.x - s, gh + 0.2, plane.z, plane.x + s, gh + 0.2, plane.z, hex.gray)
-  drawWorldLine(plane.x, gh + 0.2, plane.z - s, plane.x, gh + 0.2, plane.z + s, hex.gray)
+  drawWorldLine(plane.x - s, gh + 0.5, plane.z, plane.x + s, gh + 0.5, plane.z, hex.gray)
+  drawWorldLine(plane.x, gh + 0.5, plane.z - s, plane.x, gh + 0.5, plane.z + s, hex.gray)
 end
 
 ---------------------------------------------------------------------
 -- Trajectoire : spline fermee (Catmull-Rom) passant par des points
 ---------------------------------------------------------------------
--- Choisis le mode :
---   "infinity"  -> boucle en forme de 8 / signe infini (lemniscate)
---   "waypoints" -> boucle irreguliere definie par tes propres points
-local PATH_MODE = "infinity"
--- local PATH_MODE = "waypoints"
-
-local SPEED = 22
-
-local WAYPOINTS = {
-  {   0, 30,    0 },
-  {  70, 38,   40 },
-  { 130, 28,  -10 },
-  { 150, 45,  -80 },
-  {  60, 32, -130 },
-  { -40, 26,  -90 },
-  {-110, 40,  -30 },
-  { -70, 30,   50 },
-}
-
 local function lemniscate(n, a, base, amp)
   local pts = {}
   for i = 0, n - 1 do
@@ -315,6 +479,7 @@ local function spline(u)
   return x, y, z, dx, dy, dz
 end
 
+-- table longueur d'arc -> parametre u (vitesse constante)
 local M = #PTS * 48
 local SU, SL = { [0] = 0 }, { [0] = 0 }
 local TOTAL = 0
@@ -366,7 +531,7 @@ end
 -- Boucle principale
 ---------------------------------------------------------------------
 local t = 0
-do -- initialisation de la camera
+do
   updatePlane(t, 0)
   cam.x = plane.x - plane.fx * 16
   cam.y = plane.y + 5
@@ -396,11 +561,11 @@ while true do
     cam.x = cam.x + (dxw - cam.x) * k
     cam.y = cam.y + (dyw - cam.y) * k
     cam.z = cam.z + (dzw - cam.z) * k
-    local minY = terrainH(cam.x, cam.z) + 3
+    local minY = terrainH(cam.x, cam.z) + 4
     if cam.y < minY then cam.y = minY end
     lookAt(plane.x + plane.fx * 8, plane.y + plane.fy * 8 - 1, plane.z + plane.fz * 8)
 
-    clearFb()
+    clearBuffers()
     drawTerrain()
     drawPlane()
     present()
