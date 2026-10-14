@@ -82,7 +82,7 @@ end
 ---------------------------------------------------------------------
 local FOV     = math.rad(70)
 local FOCAL   = (W / 2) / math.tan(FOV / 2)
-local ASPECT  = 0.6
+local ASPECT  = 0.6          -- une cellule de texte est plus haute que large
 local NEAR    = 0.3
 local FAR     = 110
 
@@ -221,7 +221,6 @@ local E = {
 local plane = { x = 0, y = 0, z = 0, fx = 0, fy = 0, fz = 1, bank = 0 }
 
 local function drawPlane()
-  -- repere local de l'avion avec roulis
   local rx, ry, rz = normalize(cross(0, 1, 0, plane.fx, plane.fy, plane.fz))
   local ux, uy, uz = cross(plane.fx, plane.fy, plane.fz, rx, ry, rz)
   local cb, sb = math.cos(plane.bank), math.sin(plane.bank)
@@ -242,6 +241,7 @@ local function drawPlane()
     drawCamLine(p[1], p[2], p[3], q[1], q[2], q[3], hex[e[3]])
   end
 
+  -- ombre au sol
   local gh = terrainH(plane.x, plane.z)
   local s = 2.5
   drawWorldLine(plane.x - s, gh + 0.2, plane.z, plane.x + s, gh + 0.2, plane.z, hex.gray)
@@ -249,38 +249,115 @@ local function drawPlane()
 end
 
 ---------------------------------------------------------------------
--- Trajectoire en boucle (ellipse avec variation d'altitude)
+-- Trajectoire : spline fermee (Catmull-Rom) passant par des points
 ---------------------------------------------------------------------
-local RX, RZ = 100, 70
-local function path(t)
-  return RX * math.cos(t),
-         30 + 10 * math.sin(2 * t),
-         RZ * math.sin(t)
+-- Choisis le mode :
+--   "infinity"  -> boucle en forme de 8 / signe infini (lemniscate)
+--   "waypoints" -> boucle irreguliere definie par tes propres points
+local PATH_MODE = "infinity"
+-- local PATH_MODE = "waypoints"
+
+local SPEED = 22
+
+local WAYPOINTS = {
+  {   0, 30,    0 },
+  {  70, 38,   40 },
+  { 130, 28,  -10 },
+  { 150, 45,  -80 },
+  {  60, 32, -130 },
+  { -40, 26,  -90 },
+  {-110, 40,  -30 },
+  { -70, 30,   50 },
+}
+
+local function lemniscate(n, a, base, amp)
+  local pts = {}
+  for i = 0, n - 1 do
+    local t = 2 * math.pi * i / n
+    local d = 1 + math.sin(t) ^ 2
+    pts[#pts + 1] = {
+      a * math.cos(t) / d,
+      base + amp * math.sin(t),
+      a * math.sin(t) * math.cos(t) / d * 1.6,
+    }
+  end
+  return pts
 end
 
-local function pathVel(t)
-  return -RX * math.sin(t),
-         20 * math.cos(2 * t),
-         RZ * math.cos(t)
+local PTS
+if PATH_MODE == "waypoints" then
+  PTS = WAYPOINTS
+else
+  PTS = lemniscate(20, 140, 32, 9)
 end
 
-local function pathAcc(t)
-  return -RX * math.cos(t),
-         -40 * math.sin(2 * t),
-         -RZ * math.sin(t)
+local function cr(a, b, c, d, f)
+  local f2, f3 = f * f, f * f * f
+  local pos = 0.5 * ((2 * b) + (-a + c) * f
+            + (2 * a - 5 * b + 4 * c - d) * f2
+            + (-a + 3 * b - 3 * c + d) * f3)
+  local der = 0.5 * ((-a + c) + 2 * (2 * a - 5 * b + 4 * c - d) * f
+            + 3 * (-a + 3 * b - 3 * c + d) * f2)
+  return pos, der
 end
 
-local SPEED = 0.22
+local function spline(u)
+  local n = #PTS
+  local i = floor(u)
+  local f = u - i
+  local p0 = PTS[(i - 1) % n + 1]
+  local p1 = PTS[i % n + 1]
+  local p2 = PTS[(i + 1) % n + 1]
+  local p3 = PTS[(i + 2) % n + 1]
+  local x, dx = cr(p0[1], p1[1], p2[1], p3[1], f)
+  local y, dy = cr(p0[2], p1[2], p2[2], p3[2], f)
+  local z, dz = cr(p0[3], p1[3], p2[3], p3[3], f)
+  return x, y, z, dx, dy, dz
+end
 
-local function updatePlane(t, dt)
-  plane.x, plane.y, plane.z = path(t)
-  local vx_, vy_, vz_ = pathVel(t)
-  plane.fx, plane.fy, plane.fz = normalize(vx_, vy_, vz_)
+local M = #PTS * 48
+local SU, SL = { [0] = 0 }, { [0] = 0 }
+local TOTAL = 0
+do
+  local n = #PTS
+  local px, py, pz = spline(0)
+  for k = 1, M do
+    local u = n * k / M
+    local x, y, z = spline(u)
+    TOTAL = TOTAL + math.sqrt((x - px) ^ 2 + (y - py) ^ 2 + (z - pz) ^ 2)
+    SU[k], SL[k] = u, TOTAL
+    px, py, pz = x, y, z
+  end
+end
 
-  local ax, _, az = pathAcc(t)
-  local h2 = vx_ * vx_ + vz_ * vz_
-  local omega = (vx_ * az - vz_ * ax) / h2
-  local target = math.max(-1, math.min(1, omega * 0.9 * 4))
+local function pathAt(s)
+  s = s % TOTAL
+  local lo, hi = 0, M
+  while hi - lo > 1 do
+    local mid = floor((lo + hi) / 2)
+    if SL[mid] <= s then lo = mid else hi = mid end
+  end
+  local span = SL[hi] - SL[lo]
+  local f = span > 0 and (s - SL[lo]) / span or 0
+  local u = SU[lo] + (SU[hi] - SU[lo]) * f
+  local x, y, z, dx, dy, dz = spline(u)
+  dx, dy, dz = normalize(dx, dy, dz)
+  return x, y, z, dx, dy, dz
+end
+
+local atan2 = math.atan2 or function(y, x) return math.atan(y, x) end
+
+local function updatePlane(s, dt)
+  local x, y, z, tx, ty, tz = pathAt(s)
+  plane.x, plane.y, plane.z = x, y, z
+  plane.fx, plane.fy, plane.fz = tx, ty, tz
+
+  local ds = 4
+  local _, _, _, t2x, _, t2z = pathAt(s + ds)
+  local diff = atan2(t2z, t2x) - atan2(tz, tx)
+  while diff > math.pi do diff = diff - 2 * math.pi end
+  while diff < -math.pi do diff = diff + 2 * math.pi end
+  local target = math.max(-1, math.min(1, diff / ds * 45))
   local k = 1 - math.exp(-dt * 3)
   plane.bank = plane.bank + (target - plane.bank) * k
 end
@@ -289,7 +366,7 @@ end
 -- Boucle principale
 ---------------------------------------------------------------------
 local t = 0
-do
+do -- initialisation de la camera
   updatePlane(t, 0)
   cam.x = plane.x - plane.fx * 16
   cam.y = plane.y + 5
@@ -312,7 +389,6 @@ while true do
     t = t + SPEED * dt
     updatePlane(t, dt)
 
-    -- camera de poursuite avec lissage exponentiel
     local dxw = plane.x - plane.fx * 16
     local dyw = plane.y + 5 - plane.fy * 16
     local dzw = plane.z - plane.fz * 16
