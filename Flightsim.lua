@@ -7,14 +7,14 @@
 ---------------------------------------------------------------------
 -- CONFIG
 ---------------------------------------------------------------------
-local VIEW_DIST  = 1000   -- distance de vue (blocs)
+local VIEW_DIST  = 200   -- distance de vue (blocs)
 local GRID_STEP  = 8      -- taille des mailles proches
-local RING_N     = 10     -- mailles par demi-anneau (DOIT etre pair). Baisse a 8 si ca rame
-local FOG_DIST   = 350    -- au-dela, les lignes passent en gris
-local GRID_DIST  = 700    -- au-dela, plus de lignes : le relief reste visible en silhouette noire
+local RING_N     = 16     -- mailles par demi-anneau (DOIT etre pair). Baisse a 8 si ca rame
+local FOG_DIST   = 250    -- au-dela, les lignes passent en gris
+local GRID_DIST  = 250    -- au-dela, plus de lignes : le relief reste visible en silhouette noire
 
-local PATH_MODE  = "infinity"  -- "infinity" ou "waypoints"
-local SPEED      = 22          -- vitesse de l'avion (blocs/s)
+local PATH_MODE  = "waypoints"  -- "infinity" ou "waypoints"
+local SPEED      = 25          -- vitesse de l'avion (blocs/s)
 
 -- Boucle irreguliere (mode "waypoints") : {x, altitude, z}
 local WAYPOINTS = {
