@@ -12,7 +12,7 @@
 ---------------------------------------------------------------------
 -- CONFIG
 ---------------------------------------------------------------------
-local VIEW_DIST   = 1000   -- distance de vue (blocs)
+local VIEW_DIST   = 500   -- distance de vue (blocs)
 local GRID_STEP   = 8      -- taille des mailles proches
 local RING_N      = 10     -- mailles par demi-anneau (pair). Baisse-le si ca rame
 local FOG_START   = 0.35   -- debut de la brume (fraction de VIEW_DIST)
@@ -21,11 +21,18 @@ local FPS_MAX     = 30     -- limite d'images/seconde (1 a 60)
 local RESOLUTION  = nil    -- nil = auto ; sinon 0, 1, 2... (multiplicateur de resolution DirectGPU)
 local POLY_FILL   = "auto" -- "auto" (teste drawPolygon au demarrage), "polygon" ou "spans"
 
-local FILL_AMBIENT = 0.10  -- luminosite du sol (ombrage du relief)
-local FILL_DIFFUSE = 0.32
+local LIGHTING     = false -- true : ombrage du relief selon la pente (facettes visibles)
+local FILL_BRIGHT  = 0.32  -- luminosite du sol sans eclairage (0 = noir, 1 = couleur pleine)
+local FILL_AMBIENT = 0.10  -- (si LIGHTING) luminosite de base
+local FILL_DIFFUSE = 0.32  -- (si LIGHTING) part de lumiere directe
+local MAX_BANK_DEG = 35    -- inclinaison maximale de l'avion dans les virages
+local ROLL_SIGN    = 1     -- mettre -1 pour inverser le sens d'inclinaison (avion + cercle)
+local SHOW_GRID      = false -- true : quadrillage (lignes) ; false : polygones lisses, sans lignes
+local SMOOTH_BRIGHT  = 0.62  -- (sans lignes) luminosite du sol : 0 = noir, 1 = couleur pleine
+local RELIEF_SHADING = 0.45  -- (sans lignes) force de l'ombrage du relief : 0 = aucun, 1 = fort
 local HUD_FONT     = "Monospaced"  -- police Java toujours dispo ("Arial" aussi possible)
 
-local PATH_MODE   = "infinity"   -- "infinity" ou "waypoints"
+local PATH_MODE   = "waypoints"   -- "infinity" ou "waypoints"
 local SPEED       = 22           -- vitesse de l'avion (blocs/s)
 
 -- Boucle irreguliere (mode "waypoints") : {x, altitude, z}
@@ -292,7 +299,19 @@ local function drawSky()
   local yi = floor(clamp(yh, 0, PH))
 
   if yi < PH then
-    g_fillRect(display, 0, yi, PW, PH - yi, rgb(HAZE[1], HAZE[2], HAZE[3]))
+    -- fond sous l'horizon : brume au ras de l'horizon, puis teinte "sol" (les petits trous
+    -- entre deux polygones lointains se voient ainsi beaucoup moins)
+    local GB = { 70, 118, 72 }
+    local nb, span = 8, PH - yi
+    for i = 0, nb - 1 do
+      local y0 = yi + floor(span * i / nb)
+      local y1 = (i == nb - 1) and PH or yi + floor(span * (i + 1) / nb)
+      if y1 > y0 then
+        local t = clamp((y0 - yh) / (PH * 0.22), 0, 1) * 0.75
+        g_fillRect(display, 0, y0, PW, y1 - y0,
+          rgb(lerp(HAZE[1], GB[1], t), lerp(HAZE[2], GB[2], t), lerp(HAZE[3], GB[3], t)))
+      end
+    end
   end
   if yi > 0 then
     local bandH = yi / SKY_BANDS
@@ -367,11 +386,21 @@ local function drawCell(a, b, S)
   -- couleur du sol : altitude moyenne + ombrage (pente) + brume
   local h00, h01, h10, h11 = vh[v00], vh[v01], vh[v10], vh[v11]
   local br, bg, bb = heightColor((h00 + h01 + h10 + h11) * 0.25)
-  local dhx, dhz = (h10 - h00) / S, (h01 - h00) / S
-  local nl = sqrt(dhx * dhx + 1 + dhz * dhz)
-  local lam = (-dhx * SUN_X + SUN_Y - dhz * SUN_Z) / nl
-  if lam < 0 then lam = 0 end
-  local shade = FILL_AMBIENT + FILL_DIFFUSE * lam
+  local shade = SHOW_GRID and FILL_BRIGHT or SMOOTH_BRIGHT
+  if (SHOW_GRID and LIGHTING) or (not SHOW_GRID and RELIEF_SHADING > 0) then
+    -- normale au centre de la maille (plus douce que sur un seul coin)
+    local dhx = ((h10 + h11) - (h00 + h01)) / (2 * S)
+    local dhz = ((h01 + h11) - (h00 + h10)) / (2 * S)
+    local nl = sqrt(dhx * dhx + 1 + dhz * dhz)
+    local lam = (-dhx * SUN_X + SUN_Y - dhz * SUN_Z) / nl
+    if lam < 0 then lam = 0 end
+    if SHOW_GRID then
+      shade = FILL_AMBIENT + FILL_DIFFUSE * lam
+    else
+      -- sol plat = SMOOTH_BRIGHT ; pentes face au soleil plus claires, dos au soleil plus sombres
+      shade = clamp(SMOOTH_BRIGHT * (1 + RELIEF_SHADING * (lam - SUN_Y) / SUN_Y), 0.08, 1)
+    end
+  end
   local f = (vf[v00] + vf[v01] + vf[v10] + vf[v11]) * 0.25
   local fr, fg, fb = rgb(lerp(br * shade, HAZE[1], f), lerp(bg * shade, HAZE[2], f), lerp(bb * shade, HAZE[3], f))
 
@@ -391,11 +420,13 @@ local function drawCell(a, b, S)
   end
 
   -- lignes : chaque arete est dessinee par la maille dessinee APRES sa voisine
-  local ra, rb = rankA[a], rankB[b]
-  if a == 0 or not keep[(a - 1) * SIDE + b + 1] or rankA[a - 1] < ra then edge(v00, v01) end
-  if a == SIDE - 2 or not keep[(a + 1) * SIDE + b + 1] or rankA[a + 1] < ra then edge(v10, v11) end
-  if b == 0 or not keep[a * SIDE + b] or rankB[b - 1] < rb then edge(v00, v10) end
-  if b == SIDE - 2 or not keep[a * SIDE + b + 2] or rankB[b + 1] < rb then edge(v01, v11) end
+  if SHOW_GRID then
+    local ra, rb = rankA[a], rankB[b]
+    if a == 0 or not keep[(a - 1) * SIDE + b + 1] or rankA[a - 1] < ra then edge(v00, v01) end
+    if a == SIDE - 2 or not keep[(a + 1) * SIDE + b + 1] or rankA[a + 1] < ra then edge(v10, v11) end
+    if b == 0 or not keep[a * SIDE + b] or rankB[b - 1] < rb then edge(v00, v10) end
+    if b == SIDE - 2 or not keep[a * SIDE + b + 2] or rankB[b + 1] < rb then edge(v01, v11) end
+  end
 end
 
 -- ordre de parcours : du bord lointain vers la case de la camera
@@ -456,8 +487,10 @@ local function drawTerrain()
         end
         local f = clamp((z - FOG0) / span, 0, 1)
         vf[k] = f
-        local br, bg, bb = heightColor(h)
-        vlr[k], vlg[k], vlb[k] = rgb(lerp(br, HAZE[1], f), lerp(bg, HAZE[2], f), lerp(bb, HAZE[3], f))
+        if SHOW_GRID then
+          local br, bg, bb = heightColor(h)
+          vlr[k], vlg[k], vlb[k] = rgb(lerp(br, HAZE[1], f), lerp(bg, HAZE[2], f), lerp(bb, HAZE[3], f))
+        end
       end
     end
 
@@ -656,7 +689,7 @@ local function updatePlane(s, dt)
   local diff = atan2(t2z, t2x) - atan2(tz, tx)
   while diff > math.pi do diff = diff - 2 * math.pi end
   while diff < -math.pi do diff = diff + 2 * math.pi end
-  local target = max(-1, min(1, diff / ds * 45))
+  local target = max(-1, min(1, diff / ds * 45)) * math.rad(MAX_BANK_DEG) * ROLL_SIGN
   local k = 1 - math.exp(-dt * 3)
   plane.bank = plane.bank + (target - plane.bank) * k
 end
@@ -752,15 +785,19 @@ local function drawAttitude(pitch)
   local ar = floor(PH * 0.10)
   local ax, ay = floor(PW / 2), PH - ar - 10
   gpu.drawCircle(display, ax, ay, ar, 200, 210, 225, false)
+
+  -- horizon : reste a plat, monte/descend avec le tangage
   local d = clamp(math.rad(pitch) * ar * 1.6, -ar * 0.8, ar * 0.8)
+  local hl = floor(sqrt(max(0, ar * ar - d * d)) - 1)
+  g_drawLine(display, ax - hl, floor(ay + d + 0.5), ax + hl, floor(ay + d + 0.5), 120, 200, 255)
+
+  -- symbole d'avion : s'incline EXACTEMENT comme les ailes de l'avion a l'ecran
   local c, s = math.cos(plane.bank), math.sin(plane.bank)
-  local hl = sqrt(max(0, ar * ar - d * d)) - 1
-  local ox, oy = ax - s * d, ay + c * d
-  g_drawLine(display, floor(ox - c * hl + 0.5), floor(oy - s * hl + 0.5),
-                      floor(ox + c * hl + 0.5), floor(oy + s * hl + 0.5), 120, 200, 255)
-  g_drawLine(display, ax - 10, ay, ax - 3, ay, 255, 220, 60)
-  g_drawLine(display, ax + 3, ay, ax + 10, ay, 255, 220, 60)
-  g_drawLine(display, ax, ay - 2, ax, ay + 1, 255, 220, 60)
+  local wl = ar * 0.75
+  local lx, ly = ax - c * wl, ay + s * wl          -- aile gauche
+  local rx_, ry_ = ax + c * wl, ay - s * wl        -- aile droite (haute si bank > 0)
+  g_drawLine(display, floor(lx + 0.5), floor(ly + 0.5), floor(rx_ + 0.5), floor(ry_ + 0.5), 255, 220, 60)
+  g_drawLine(display, ax, ay, floor(ax - s * ar * 0.35 + 0.5), floor(ay - c * ar * 0.35 + 0.5), 255, 220, 60)  -- derive
 end
 
 local function drawHUD(fps, ms, dist)
@@ -797,7 +834,7 @@ local function drawHUD(fps, ms, dist)
   text(string.format("SPD %4d  V/S %+.1f", floor(SPEED), plane.fy * SPEED), 8, y0 + LH, 235, 240, 250)
   text(string.format("HDG %03d %-2s PIT %+d", floor(hdg + 0.5) % 360, WIND[floor((hdg + 22.5) / 45) % 8 + 1], floor(pitch + 0.5)),
        8, y0 + LH * 2, 235, 240, 250)
-  text(string.format("ROLL %+d", floor(math.deg(plane.bank) + 0.5)), 8, y0 + LH * 3, 235, 240, 250)
+  text(string.format("ROLL %+d", -floor(math.deg(plane.bank) + 0.5)), 8, y0 + LH * 3, 235, 240, 250)
 end
 
 ---------------------------------------------------------------------
